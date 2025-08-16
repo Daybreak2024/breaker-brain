@@ -1,0 +1,68 @@
+from flask import Flask, request, jsonify, abort
+import os
+import hmac
+import hashlib
+import time
+import requests
+
+app = Flask(__name__)
+SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
+
+def verify_slack_request(req):
+    timestamp = req.headers.get("X-Slack-Request-Timestamp")
+    if abs(time.time() - int(timestamp)) > 60 * 5:
+        return False  # replay attack
+    sig_basestring = f"v0:{timestamp}:{req.get_data(as_text=True)}"
+    my_signature = (
+        "v0="
+        + hmac.new(
+            SLACK_SIGNING_SECRET.encode(),
+            sig_basestring.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+    )
+    slack_signature = req.headers.get("X-Slack-Signature")
+    return hmac.compare_digest(my_signature, slack_signature)
+
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    if not verify_slack_request(request):
+        abort(403)
+    data = request.json
+
+    # Respond to Slack URL verification
+    if "challenge" in data:
+        return jsonify({"challenge": data["challenge"]})
+
+    # Handle mentions
+    event = data.get("event", {})
+    if event.get("type") == "app_mention":
+        user = event.get("user")
+        channel = event.get("channel")
+        response_text = (
+            f"<@{user}> Which lens do you want to apply?\n"
+            "• CFO Skeptic\n"
+            "• Builder CEO\n"
+            "• Scaler\n"
+            "• Challenger\n"
+            "• Operator"
+        )
+
+        # Send message back to Slack
+        headers = {
+            "Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "channel": channel,
+            "text": response_text
+        }
+        requests.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload)
+
+    return "", 200
+
+
+if __name__ == "__main__":
+    print("✅ Flask is running. Waiting for Slack events...")
+    app.run(port=3000)
+

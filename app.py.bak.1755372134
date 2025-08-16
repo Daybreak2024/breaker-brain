@@ -1,0 +1,169 @@
+import os, json, sqlite3, time
+from datetime import datetime
+from typing import Optional
+
+from flask import Flask, request, jsonify, make_response
+from slack_sdk import WebClient
+from slack_sdk.signature import SignatureVerifier
+from dotenv import load_dotenv
+
+# --- Env & App setup ---
+load_dotenv()
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+PORT = int(os.getenv("PORT", "3000"))
+
+if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
+    raise RuntimeError("Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET in .env")
+
+app = Flask(__name__)
+client = WebClient(token=SLACK_BOT_TOKEN)
+verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
+
+# --- SQLite corpus logging ---
+DB_PATH = "corpus.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS corpus (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            user TEXT,
+            channel TEXT,
+            kind TEXT,            -- 'event' | 'command' | 'interaction'
+            text TEXT,
+            payload_json TEXT,
+            created_at TEXT
+        )""")
+
+def log_corpus(kind: str, text: str = "", user: str = "", channel: str = "", payload: Optional[dict] = None):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO corpus (ts, user, channel, kind, text, payload_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                (str(time.time()), user or "", channel or "", kind, text or "", json.dumps(payload or {}), datetime.utcnow().isoformat())
+            )
+    except Exception as e:
+        print(f"[corpus] log error: {e}")
+
+init_db()
+
+# --- Helpers ---
+def verify_request(req) -> bool:
+    try:
+        return verifier.is_valid_request(req.get_data(), req.headers)
+    except Exception as e:
+        print(f"[signing] verification error: {e}")
+        return False
+
+# --- Health check ---
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+# --- Events API ---
+@app.post("/slack/events")
+def slack_events():
+    if not verify_request(request):
+        return make_response("invalid signature", 401)
+
+    body = request.get_json(silent=True) or {}
+
+    # Slack URL verification
+    if body.get("type") == "url_verification":
+        return jsonify({"challenge": body.get("challenge")})
+
+    if body.get("type") == "event_callback":
+        event = body.get("event", {})
+
+        # Log user messages (ignore bot messages)
+        if event.get("type") == "message" and not event.get("bot_id"):
+            log_corpus("event", event.get("text",""), event.get("user",""), event.get("channel",""), event)
+
+        # Optional helper reply on mentions
+        if event.get("type") == "app_mention":
+            try:
+                client.chat_postMessage(
+                    channel=event.get("channel"),
+                    thread_ts=event.get("ts"),
+                    text="Try `/lens` to pick a review lens, or `/decide <prompt>` for a decision template."
+                )
+            except Exception as e:
+                print(f"[events] post error: {e}")
+
+    return make_response("", 200)
+
+# --- Interactivity (buttons, etc.) ---
+@app.post("/slack/interactivity")
+def interactivity():
+    if not verify_request(request):
+        return make_response("invalid signature", 401)
+
+    payload = json.loads(request.form.get("payload", "{}"))
+    user_id = (payload.get("user") or {}).get("id", "")
+    channel_id = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get("channel_id", "")
+
+    log_corpus("interaction", (payload.get("message") or {}).get("text", ""), user_id, channel_id, payload)
+
+    if payload.get("type") == "block_actions":
+        try:
+            action = payload["actions"][0]
+            selected = action.get("value")
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"Lens applied: {selected}",
+                blocks=[{"type":"section","text":{"type":"mrkdwn","text":f"➕ *Lens applied:* `{selected}`"}}],
+            )
+        except Exception as e:
+            print(f"[interactivity] error: {e}")
+        return make_response("", 200)
+
+    if payload.get("type") == "view_submission":
+        return jsonify({"response_action": "clear"})
+
+    return make_response("", 200)
+
+# --- Slash Commands ---
+@app.post("/slack/commands")
+def commands():
+    if not verify_request(request):
+        return make_response("invalid signature", 401)
+
+    form = request.form
+    cmd = form.get("command")
+    user_id = form.get("user_id")
+    channel_id = form.get("channel_id")
+    text = form.get("text", "")
+
+    log_corpus("command", text, user_id, channel_id, dict(form))
+
+    if cmd == "/lens":
+        return jsonify({"response_type": "ephemeral","text": "Which lens do you want to apply?","blocks": lens_picker_blocks()})
+
+    if cmd == "/decide":
+        prompt = text.strip() or "No prompt provided."
+        return jsonify({"response_type": "ephemeral","blocks": decision_template_blocks(prompt)})
+
+    return jsonify({"response_type": "ephemeral","text": f"Unsupported command `{cmd}`. Try `/lens` or `/decide`."})
+
+# --- Block Kit builders ---
+def lens_picker_blocks():
+    lenses = [("CFO Skeptic","cfo_skeptic"),("Builder CEO","builder_ceo"),("Scaler","scaler"),("Challenger","challenger"),("Operator","operator")]
+    buttons = [{"type":"button","text":{"type":"plain_text","text":label},"action_id":"apply_lens","value":value} for (label,value) in lenses]
+    return [{"type":"section","text":{"type":"mrkdwn","text":"*Which lens do you want to apply?*"}},{"type":"actions","elements":buttons}]
+
+def decision_template_blocks(prompt: str):
+    return [
+        {"type":"header","text":{"type":"plain_text","text":"Decision Template"}},
+        {"type":"section","text":{"type":"mrkdwn","text":f"*Prompt:* {prompt}"}},
+        {"type":"section","text":{"type":"mrkdwn","text":"*Options*\n1) Option A\n2) Option B\n3) Option C"}},
+        {"type":"section","text":{"type":"mrkdwn","text":"*Recommendation*\n<fill in>"}},
+        {"type":"section","text":{"type":"mrkdwn","text":"*Risks & Mitigations*\n- Risk 1 → Mitigation\n- Risk 2 → Mitigation"}},
+        {"type":"context","elements":[{"type":"mrkdwn","text":"Use `/decide {prompt}` to regenerate."}]},
+    ]
+
+# --- Entrypoint ---
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT, debug=True)
