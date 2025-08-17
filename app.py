@@ -136,10 +136,13 @@ def interactivity():
         (payload.get("channel") or {}).get("id")
         or (payload.get("container") or {}).get("channel_id", "")
     )
+
+    # Log everything
     log_corpus("interaction",
                text=(payload.get("message") or {}).get("text", ""),
                user=user_id, channel=channel_id, payload=payload)
 
+    # ---------- 1) MESSAGE SHORTCUT ----------
     if payload.get("type") == "message_action" and payload.get("callback_id") == "apply_lens_action":
         try:
             client.chat_postEphemeral(
@@ -148,17 +151,26 @@ def interactivity():
                 text="Which lens do you want to apply?",
                 blocks=lens_picker_blocks(),
             )
+            print("[shortcut] posted lens picker OK")
         except Exception as e:
-            print("[shortcut/apply_lens_action] error:", repr(e))
+            try:
+                from slack_sdk.errors import SlackApiError
+                if isinstance(e, SlackApiError):
+                    print("[shortcut] Slack error:", e.response.get("error"))
+                else:
+                    print("[shortcut] other error:", repr(e))
+            except Exception:
+                print("[shortcut] error:", repr(e))
         return make_response("", 200)
 
+    # ---------- 2) BUTTON CLICKS ----------
     if payload.get("type") == "block_actions":
         action = (payload.get("actions") or [{}])[0]
         aid = action.get("action_id", "")
         selected = action.get("value", "")
 
+        # Publish lens result to channel
         if aid == "post_lens":
-            # publish lens result
             try:
                 original_blocks = (payload.get("message") or {}).get("blocks", [])
                 client.chat_postMessage(channel=channel_id, text="Lens Analysis", blocks=original_blocks)
@@ -168,26 +180,56 @@ def interactivity():
                 print("[interactivity/post_lens] error:", repr(e))
             return make_response("", 200)
 
+        # Lens selection
         if aid.startswith("lens_") or selected in {"cfo_skeptic","builder_ceo","scaler","challenger","operator"}:
-            # your lens async/sync handling here
-            ...
-            return make_response("", 200)
+            lens = selected
+            label = LENS_NAMES.get(lens, lens)
+            original_text = (payload.get("message") or {}).get("text", "") or ""
 
+            # quick ack so user sees something
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=f"⏳ {label} analysis…")
+            except Exception as e:
+                print("[lens ack] error:", repr(e))
+
+            if original_text.strip():
+                # run in background and return fast
+                threading.Thread(
+                    target=_post_lens_result_async,
+                    args=(lens, original_text, channel_id, user_id),
+                    daemon=True
+                ).start()
+                return make_response("", 200)
+
+            # No context: PUSH a modal in the HTTP response (most reliable)
+            view = {
+                "type": "modal",
+                "callback_id": "lens_modal",
+                "private_metadata": json.dumps({
+                    "lens": lens,
+                    "channel_id": channel_id,
+                    "user_id": user_id
+                }),
+                "title": {"type": "plain_text", "text": f"{label} Lens"},
+                "submit": {"type": "plain_text", "text": "Analyze"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {"type":"input","block_id":"ctx",
+                     "element":{"type":"plain_text_input","action_id":"v","multiline":True,
+                                "placeholder":{"type":"plain_text","text":"Paste the proposal or context to analyze…"}},
+                     "label":{"type":"plain_text","text":"Context"}}
+                ]
+            }
+            return jsonify({"response_action": "push", "view": view})
+
+        # Unknown action
         return make_response("", 200)
 
+    # ---------- 3) MODAL SUBMISSIONS ----------
     if payload.get("type") == "view_submission":
         view = payload.get("view") or {}
         cb = view.get("callback_id", "")
-        if cb == "lens_modal":
-            # handle modal submit
-            ...
-            return jsonify({"response_action": "clear"})
 
-    return make_response("", 200)
-
-    if payload.get("type") == "view_submission":
-        view = payload.get("view", {}) or {}
-        cb = view.get("callback_id", "")
         if cb == "lens_modal":
             try:
                 pm = json.loads(view.get("private_metadata") or "{}")
@@ -197,19 +239,21 @@ def interactivity():
                 chan = pm.get("channel_id")
                 usr = pm.get("user_id")
 
-                # quick ack to close the modal
                 try:
                     client.chat_postEphemeral(channel=chan, user=usr, text=f"⏳ {LENS_NAMES.get(lens,lens)} analysis…")
                 except Exception as e:
                     print("[lens modal ack] error:", repr(e))
 
-                threading.Thread(target=_post_lens_result_async,
-                                 args=(lens, ctx, chan, usr),
-                                 daemon=True).start()
+                threading.Thread(
+                    target=_post_lens_result_async,
+                    args=(lens, ctx, chan, usr),
+                    daemon=True
+                ).start()
             except Exception as e:
                 print("[lens modal submit] error:", repr(e))
             return jsonify({"response_action": "clear"})
 
+    # default ack
     return make_response("", 200)
 
 # ---------- Slash commands ----------
@@ -223,6 +267,7 @@ def commands():
     user_id = form.get("user_id")
     channel_id = form.get("channel_id")
     text = form.get("text", "")
+    trigger_id = form.get("trigger_id")
 
     log_corpus("command", text, user_id, channel_id, dict(form))
 
@@ -243,9 +288,8 @@ def commands():
         return ack
 
     if cmd == "/decide":
-        trigger_id = form.get("trigger_id")
+        # Open the decision modal via views_open (slash-commands path)
         pm = json.dumps({"channel_id": channel_id, "user_id": user_id})
-
         view = {
             "type": "modal",
             "callback_id": "decide_modal",
@@ -254,29 +298,30 @@ def commands():
             "submit": {"type": "plain_text", "text": "Create"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": [
-                {"type":"input","block_id":"title","element":{"type":"plain_text_input","action_id":"v","placeholder":{"type":"plain_text","text":"One-line decision title"}},"label":{"type":"plain_text","text":"Title"}},
-                {"type":"input","block_id":"context","element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Context, constraints, what matters"}},"label":{"type":"plain_text","text":"Context"}},
-                {"type":"input","block_id":"options","element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Option A\\nOption B\\nOption C"}},"label":{"type":"plain_text","text":"Options (one per line)"}},
-                {"type":"input","block_id":"recommendation","element":{"type":"plain_text_input","action_id":"v","placeholder":{"type":"plain_text","text":"Your recommended option"}},"label":{"type":"plain_text","text":"Recommendation"}},
-                {"type":"input","block_id":"risks","optional":True,"element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Risk → Mitigation"}},"label":{"type":"plain_text","text":"Risks & Mitigations"}}
+                {"type":"input","block_id":"title",
+                 "element":{"type":"plain_text_input","action_id":"v","placeholder":{"type":"plain_text","text":"One-line decision title"}},
+                 "label":{"type":"plain_text","text":"Title"}},
+                {"type":"input","block_id":"context",
+                 "element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Context, constraints, what matters"}},
+                 "label":{"type":"plain_text","text":"Context"}},
+                {"type":"input","block_id":"options",
+                 "element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Option A\nOption B\nOption C"}},
+                 "label":{"type":"plain_text","text":"Options (one per line)"}},
+                {"type":"input","block_id":"recommendation",
+                 "element":{"type":"plain_text_input","action_id":"v","placeholder":{"type":"plain_text","text":"Your recommended option"}},
+                 "label":{"type":"plain_text","text":"Recommendation"}},
+                {"type":"input","block_id":"risks","optional":True,
+                 "element":{"type":"plain_text_input","action_id":"v","multiline":True,"placeholder":{"type":"plain_text","text":"Risk → Mitigation"}},
+                 "label":{"type":"plain_text","text":"Risks & Mitigations"}}
             ]
         }
-
         try:
             client.views_open(trigger_id=trigger_id, view=view)
         except Exception as e:
             print("[/decide] views_open error:", repr(e))
-            # Fallback: if modal fails for any reason, send the template
-            client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text="Decision Template",
-                blocks=decision_template_blocks(form.get("text","") or "No prompt provided.")
-            )
-
-        # Short ack so Slack is happy
         return jsonify({"response_type": "ephemeral", "text": "Opening decision modal…"})
-
+    
+    return jsonify({"response_type": "ephemeral", "text": f"Unsupported command `{cmd}`."})
 
 # ---------- Block Kit builders ----------
 def lens_picker_blocks():
