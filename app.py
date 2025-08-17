@@ -126,21 +126,56 @@ def slack_events():
 
 # ---------- Interactivity (buttons) ----------
 @app.post("/slack/interactivity")
-print("[interactivity] type=", (payload.get("type")))
-# TEMP: always push a tiny modal so we can prove Slack -> server -> modal works
-if payload.get("type") == "block_actions":
-    return jsonify({
-        "response_action": "push",
-        "view": {
-            "type": "modal",
-            "title": {"type": "plain_text", "text": "Test Modal"},
-            "close": {"type": "plain_text", "text": "Close"},
-            "blocks": [
-                {"type":"section","text":{"type":"mrkdwn","text":"If you see this, push works."}}
-            ],
-            "callback_id": "noop"
-        }
-    })
+def interactivity():
+    if not verify_request(request):
+        return make_response("invalid signature", 401)
+
+    # Parse Slack payload first
+    payload = json.loads(request.form.get("payload", "{}"))
+    print("[interactivity] type =", payload.get("type"))
+
+    # === TEMP SMOKE TEST: push a tiny modal for ANY button click ===
+    # (Remove this whole 'if' block after you verify the modal appears.)
+    if payload.get("type") == "block_actions":
+        return jsonify({
+            "response_action": "push",
+            "view": {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Test Modal"},
+                "close": {"type": "plain_text", "text": "Close"},
+                "blocks": [
+                    {"type": "section",
+                     "text": {"type": "mrkdwn", "text": "If you see this, push works ✅"}}
+                ],
+                "callback_id": "noop"
+            }
+        })
+    # === end TEMP block ===
+
+    # (Your normal code continues below)
+    user_id = (payload.get("user") or {}).get("id", "")
+    channel_id = (
+        (payload.get("channel") or {}).get("id")
+        or (payload.get("container") or {}).get("channel_id", "")
+    )
+    log_corpus(
+        "interaction",
+        text=(payload.get("message") or {}).get("text", ""),
+        user=user_id, channel=channel_id, payload=payload
+    )
+
+    # ... keep your existing message_action / block_actions / view_submission logic here ...
+            "response_action": "push",
+            "view": {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Test Modal"},
+                "close": {"type": "plain_text", "text": "Close"},
+                "blocks": [
+                    {"type":"section","text":{"type":"mrkdwn","text":"If you see this, push works."}}
+                ],
+                "callback_id": "noop"
+            }
+        })
 
 def interactivity():
     if not verify_request(request):
