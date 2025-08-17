@@ -412,5 +412,38 @@ def _post_lens_result_async(lens: str, text: str, channel_id: str, user_id: str)
         print("[post_lens] Slack error:", repr(e))
 
 # ---------- Entrypoint ----------
+
+# --- JSON APIs for direct testing (no Slack) ---
+@app.post("/api/lens")
+def api_lens():
+    data = request.get_json(silent=True) or {}
+    lens = data.get("lens", "cfo_skeptic")
+    text = data.get("text", "") or ""
+    # use the real runner if present; otherwise fallback checklist
+    try:
+        md = run_lens(lens, text)
+    except Exception:
+        md = _fallback_lens_text(lens, text)
+    log_corpus("api_lens", text, "", "", data)
+    return {"ok": True, "lens": lens, "result": md}, 200
+
+@app.post("/api/decide")
+def api_decide():
+    d = request.get_json(silent=True) or {}
+    title = d.get("title", "Decision")
+    context = d.get("context", "")
+    options = d.get("options", "")
+    rec = d.get("recommendation", "")
+    risks = d.get("risks", "")
+    brief_md = (
+        f"# {title}\n\n"
+        f"**Context**\n{context or '—'}\n\n"
+        f"**Options**\n{options or '—'}\n\n"
+        f"**Recommendation**\n{rec or '—'}\n\n"
+        f"**Risks & Mitigations**\n{risks or '—'}\n"
+    )
+    log_corpus("api_decide", title, "", "", d)
+    return {"ok": True, "brief_md": brief_md}, 200
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=True)
