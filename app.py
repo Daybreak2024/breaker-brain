@@ -126,6 +126,22 @@ def slack_events():
 
 # ---------- Interactivity (buttons) ----------
 @app.post("/slack/interactivity")
+print("[interactivity] type=", (payload.get("type")))
+# TEMP: always push a tiny modal so we can prove Slack -> server -> modal works
+if payload.get("type") == "block_actions":
+    return jsonify({
+        "response_action": "push",
+        "view": {
+            "type": "modal",
+            "title": {"type": "plain_text", "text": "Test Modal"},
+            "close": {"type": "plain_text", "text": "Close"},
+            "blocks": [
+                {"type":"section","text":{"type":"mrkdwn","text":"If you see this, push works."}}
+            ],
+            "callback_id": "noop"
+        }
+    })
+
 def interactivity():
     if not verify_request(request):
         return make_response("invalid signature", 401)
