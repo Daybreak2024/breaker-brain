@@ -218,9 +218,11 @@ def slack_events():
 # ---------- Interactivity ----------
 @app.post("/slack/interactivity")
 def interactivity():
+    # --- 0) Verify Slack signature ---
     if not verify_request(request):
         return make_response("invalid signature", 401)
 
+    # --- 1) Parse payload & basics ---
     payload = json.loads(request.form.get("payload", "{}"))
     print("[interactivity] type =", payload.get("type")); import sys; sys.stdout.flush()
 
@@ -229,30 +231,19 @@ def interactivity():
         (payload.get("channel") or {}).get("id")
         or (payload.get("container") or {}).get("channel_id", "")
     )
+    trigger_id = payload.get("trigger_id", "")
 
-    # TEMP safety: if enabled, always push a trivial modal to prove wiring
-    if TEST_MODAL_ALWAYS and payload.get("type") == "block_actions":
-        return jsonify({
-            "response_action": "push",
-            "view": {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Breaker Brain"},
-                "close": {"type": "plain_text", "text": "Close"},
-                "blocks": [
-                    {"type":"section","text":{"type":"mrkdwn","text":"✅ Modal push is working (TEST_MODAL_ALWAYS=1)."}}
-                ],
-                "callback_id": "noop"
-            }
-        })
+    # Log the interaction (optional)
+    try:
+        log_corpus(
+            "interaction",
+            text=(payload.get("message") or {}).get("text", ""),
+            user=user_id, channel=channel_id, payload=payload
+        )
+    except Exception as e:
+        print("[corpus] log error:", repr(e))
 
-    # Log interaction
-    log_corpus(
-        "interaction",
-        text=(payload.get("message") or {}).get("text", ""),
-        user=user_id, channel=channel_id, payload=payload
-    )
-
-    # 1) MESSAGE SHORTCUT → show lens picker
+    # --- 2) MESSAGE SHORTCUT -> show lens picker in channel ---
     if payload.get("type") == "message_action" and payload.get("callback_id") == "apply_lens_action":
         try:
             client.chat_postEphemeral(
@@ -262,20 +253,19 @@ def interactivity():
                 blocks=lens_picker_blocks(),
             )
             print("[shortcut] posted lens picker OK")
+        except SlackApiError as e:
+            print("[shortcut] Slack error:", e.response.get("error"))
         except Exception as e:
-            if isinstance(e, SlackApiError):
-                print("[shortcut] Slack error:", e.response.get("error"))
-            else:
-                print("[shortcut] other error:", repr(e))
+            print("[shortcut] other error:", repr(e))
         return make_response("", 200)
 
-    # 2) BUTTON CLICKS (lens selection or post action)
+    # --- 3) BUTTON CLICKS ---
     if payload.get("type") == "block_actions":
         action = (payload.get("actions") or [{}])[0]
         aid = action.get("action_id", "")
         selected = action.get("value", "")
 
-        # publish final analysis to channel
+        # 3a) Post-to-channel button (if you keep this in your UI)
         if aid == "post_lens":
             try:
                 original_blocks = (payload.get("message") or {}).get("blocks", [])
@@ -286,7 +276,7 @@ def interactivity():
                 print("[interactivity/post_lens] error:", repr(e))
             return make_response("", 200)
 
-        # lens selected
+        # 3b) Lens selection buttons
         if aid.startswith("lens_") or selected in {"cfo_skeptic","builder_ceo","scaler","challenger","operator"}:
             lens = selected or {
                 "lens_cfo": "cfo_skeptic",
@@ -297,20 +287,19 @@ def interactivity():
             }.get(aid, "")
             label = LENS_NAMES.get(lens, lens or "Lens")
 
-            # Quick ack to user
+            # quick ack so the user sees activity
             try:
                 client.chat_postEphemeral(channel=channel_id, user=user_id, text=f"⏳ {label} analysis…")
             except Exception as e:
                 print("[lens ack] error:", repr(e))
 
-            # Determine if we have real context (message shortcut path provides original text)
+            # If the original message text is present (from a message shortcut), analyze it inline
             orig_text = (payload.get("message") or {}).get("text", "") or ""
             picker_text = "which lens do you want to apply"
             has_context = bool(orig_text.strip()) and picker_text not in orig_text.lower()
             print("[lens] aid=", aid, "selected=", lens, "has_context=", has_context)
 
             if has_context:
-                # Synchronous path: analyze and return result via ephemeral message
                 try:
                     md = run_lens(lens, orig_text)
                     client.chat_postEphemeral(
@@ -322,8 +311,23 @@ def interactivity():
                     print("[lens sync] post error:", repr(e))
                 return make_response("", 200)
 
-            # No usable context → PUSH a modal in the HTTP response (most reliable)
-            trigger_id = payload.get("trigger_id")
+            # No usable context -> OPEN a modal with views.open (NOT response_action=push)
+            view = {
+                "type": "modal",
+                "callback_id": "lens_modal",
+                "private_metadata": json.dumps({
+                    "lens": lens, "channel_id": channel_id, "user_id": user_id
+                }),
+                "title": {"type": "plain_text", "text": f"{label} Lens"},
+                "submit": {"type": "plain_text", "text": "Analyze"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {"type":"input","block_id":"ctx",
+                     "element":{"type":"plain_text_input","action_id":"v","multiline":True,
+                                "placeholder":{"type":"plain_text","text":"Paste the proposal or context to analyze…"}},
+                     "label":{"type":"plain_text","text":"Context"}}
+                ]
+            }
             try:
                 client.views_open(trigger_id=trigger_id, view=view)
                 print("[lens] opened modal via views.open")
@@ -333,10 +337,10 @@ def interactivity():
                 print("[lens] views.open other error:", repr(e))
             return make_response("", 200)
 
-        # Unknown action
+        # Unknown button — just ack
         return make_response("", 200)
 
-    # 3) MODAL SUBMISSION → run analysis async and clear modal
+    # --- 4) MODAL SUBMISSIONS ---
     if payload.get("type") == "view_submission":
         view = payload.get("view") or {}
         cb = view.get("callback_id", "")
@@ -345,10 +349,9 @@ def interactivity():
                 pm = json.loads(view.get("private_metadata") or "{}")
                 state = (view.get("state") or {}).get("values", {})
                 ctx = (((state.get("ctx") or {}).get("v") or {}).get("value") or "").strip()
-                lens = pm.get("lens")
-                chan = pm.get("channel_id")
-                usr = pm.get("user_id")
+                lens = pm.get("lens"); chan = pm.get("channel_id"); usr = pm.get("user_id")
 
+                # immediate ack to user in-channel, then compute async
                 try:
                     client.chat_postEphemeral(channel=chan, user=usr, text=f"⏳ {LENS_NAMES.get(lens,lens)} analysis…")
                 except Exception as e:
@@ -361,9 +364,11 @@ def interactivity():
                 ).start()
             except Exception as e:
                 print("[lens modal submit] error:", repr(e))
+
+            # close the modal
             return jsonify({"response_action": "clear"})
 
-    # default ack
+    # --- default ack ---
     return make_response("", 200)
 
 # ---------- Slash commands ----------
