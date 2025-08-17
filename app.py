@@ -132,6 +132,22 @@ def interactivity():
 
     # Parse payload
     payload = json.loads(request.form.get("payload", "{}"))
+    # === TEMP: push a test modal for ANY button click (remove after we see it) ===
+    if payload.get("type") == "block_actions":
+        return jsonify({
+            "response_action": "push",
+            "view": {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Test Modal"},
+                "close": {"type": "plain_text", "text": "Close"},
+                "blocks": [
+                    {"type":"section","text":{"type":"mrkdwn","text":"If you see this, push works ✅"}}
+                ],
+                "callback_id": "noop"
+            }
+        })
+    # === end TEMP block ===
+
     print("[interactivity] type =", payload.get("type"))
 
     user_id = (payload.get("user") or {}).get("id", "")
