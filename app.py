@@ -300,14 +300,27 @@ def decision_template_blocks(prompt: str):
 # ---------- Corpus export (optional) ----------
 @app.get("/corpus/export")
 def export_corpus():
-    import csv
-    path = "corpus_export.csv"
-    with sqlite3.connect(DB_PATH) as conn, open(path, "w", newline="") as f:
+    import os, csv, sqlite3
+
+    # Require admin token header
+    token = request.headers.get("X-Admin-Token", "")
+    if token != os.getenv("ADMIN_TOKEN", ""):
+        return {"ok": False, "error": "unauthorized"}, 401
+
+    db_path = os.getenv("DB_PATH", "corpus.db")          # respects your env setting
+    out_path = "/var/data/corpus_export.csv"             # write onto the mounted disk
+
+    with sqlite3.connect(db_path) as conn, open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["id","ts","user","channel","kind","text","payload_json","created_at"])
-        for row in conn.execute("SELECT id,ts,user,channel,kind,text,payload_json,created_at FROM corpus ORDER BY id"):
+        for row in conn.execute(
+            "SELECT id,ts,user,channel,kind,text,payload_json,created_at "
+            "FROM corpus ORDER BY id"
+        ):
             w.writerow(row)
-    return {"ok": True, "path": path}, 200
+
+    return {"ok": True, "path": out_path}, 200
+
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
