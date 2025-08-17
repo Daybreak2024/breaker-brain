@@ -130,68 +130,22 @@ def interactivity():
     if not verify_request(request):
         return make_response("invalid signature", 401)
 
-    # Parse Slack payload first
+    # Parse payload
     payload = json.loads(request.form.get("payload", "{}"))
     print("[interactivity] type =", payload.get("type"))
 
-    # === TEMP SMOKE TEST: push a tiny modal for ANY button click ===
-    # (Remove this whole 'if' block after you verify the modal appears.)
-    if payload.get("type") == "block_actions":
-        return jsonify({
-            "response_action": "push",
-            "view": {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Test Modal"},
-                "close": {"type": "plain_text", "text": "Close"},
-                "blocks": [
-                    {"type": "section",
-                     "text": {"type": "mrkdwn", "text": "If you see this, push works ✅"}}
-                ],
-                "callback_id": "noop"
-            }
-        })
-    # === end TEMP block ===
-
-    # (Your normal code continues below)
     user_id = (payload.get("user") or {}).get("id", "")
     channel_id = (
         (payload.get("channel") or {}).get("id")
         or (payload.get("container") or {}).get("channel_id", "")
     )
+
+    # Log the interaction
     log_corpus(
         "interaction",
         text=(payload.get("message") or {}).get("text", ""),
         user=user_id, channel=channel_id, payload=payload
     )
-
-    # ... keep your existing message_action / block_actions / view_submission logic here ...
-            "response_action": "push",
-            "view": {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Test Modal"},
-                "close": {"type": "plain_text", "text": "Close"},
-                "blocks": [
-                    {"type":"section","text":{"type":"mrkdwn","text":"If you see this, push works."}}
-                ],
-                "callback_id": "noop"
-            }
-        })
-
-def interactivity():
-    if not verify_request(request):
-        return make_response("invalid signature", 401)
-
-    payload = json.loads(request.form.get("payload", "{}"))
-    user_id = (payload.get("user") or {}).get("id", "")
-    channel_id = (
-        (payload.get("channel") or {}).get("id")
-        or (payload.get("container") or {}).get("channel_id", "")
-    )
-
-    # Log everything
-    log_corpus("interaction",
-               text=(payload.get("message") or {}).get("text", ""),
-               user=user_id, channel=channel_id, payload=payload)
 
     # ---------- 1) MESSAGE SHORTCUT ----------
     if payload.get("type") == "message_action" and payload.get("callback_id") == "apply_lens_action":
@@ -220,7 +174,7 @@ def interactivity():
         aid = action.get("action_id", "")
         selected = action.get("value", "")
 
-        # Publish lens result to channel
+        # publish final analysis to channel
         if aid == "post_lens":
             try:
                 original_blocks = (payload.get("message") or {}).get("blocks", [])
@@ -231,30 +185,29 @@ def interactivity():
                 print("[interactivity/post_lens] error:", repr(e))
             return make_response("", 200)
 
-        # Lens selection
+        # lens selected
         if aid.startswith("lens_") or selected in {"cfo_skeptic","builder_ceo","scaler","challenger","operator"}:
             lens = selected
             label = LENS_NAMES.get(lens, lens)
 
-            # Text of the Slack message the button belongs to
+            # Determine if we have real context (message shortcut path)
             orig_text = (payload.get("message") or {}).get("text", "") or ""
             picker_text = "which lens do you want to apply"
             has_context = bool(orig_text.strip()) and picker_text not in orig_text.lower()
+            print("[lens] aid=", aid, "selected=", selected, "has_context=", has_context)
 
-            # Quick ack so the user sees something
+            # Quick ack so user sees activity
             try:
                 client.chat_postEphemeral(channel=channel_id, user=user_id, text=f"⏳ {label} analysis…")
             except Exception as e:
                 print("[lens ack] error:", repr(e))
 
             if has_context:
-                # --- DEBUG: run synchronously so we SEE the result now ---
+                # Run synchronously so you see the result now
                 try:
                     md = run_lens(lens, orig_text)
                     client.chat_postEphemeral(
-                        channel=channel_id,
-                        user=user_id,
-                        text=label,
+                        channel=channel_id, user=user_id, text=label,
                         blocks=[{"type":"section","text":{"type":"mrkdwn","text": md[:2900]}}],
                     )
                     print("[lens sync] posted result OK")
@@ -262,14 +215,12 @@ def interactivity():
                     print("[lens sync] post error:", repr(e))
                 return make_response("", 200)
 
-            # No usable context (e.g., invoked from /lens). PUSH the modal in the HTTP response.
+            # No usable context → PUSH a modal in the HTTP response (most reliable)
             view = {
                 "type": "modal",
                 "callback_id": "lens_modal",
                 "private_metadata": json.dumps({
-                    "lens": lens,
-                    "channel_id": channel_id,
-                    "user_id": user_id
+                    "lens": lens, "channel_id": channel_id, "user_id": user_id
                 }),
                 "title": {"type": "plain_text", "text": f"{label} Lens"},
                 "submit": {"type": "plain_text", "text": "Analyze"},
@@ -283,11 +234,13 @@ def interactivity():
             }
             return jsonify({"response_action": "push", "view": view})
 
+        # Unknown action
+        return make_response("", 200)
+
     # ---------- 3) MODAL SUBMISSIONS ----------
     if payload.get("type") == "view_submission":
         view = payload.get("view") or {}
         cb = view.get("callback_id", "")
-
         if cb == "lens_modal":
             try:
                 pm = json.loads(view.get("private_metadata") or "{}")
@@ -302,6 +255,7 @@ def interactivity():
                 except Exception as e:
                     print("[lens modal ack] error:", repr(e))
 
+                # background is fine here; we already responded with a modal
                 threading.Thread(
                     target=_post_lens_result_async,
                     args=(lens, ctx, chan, usr),
