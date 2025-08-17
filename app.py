@@ -248,7 +248,8 @@ def interactivity():
                      "label":{"type":"plain_text","text":"Context"}}
                 ]
             }
-            return jsonify({"response_action": "push", "view": view})
+           print("[lens] pushing modal via response_action=push") 
+           return jsonify({"response_action": "push", "view": view})
 
         # Unknown action
         return make_response("", 200)
