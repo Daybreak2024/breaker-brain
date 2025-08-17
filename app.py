@@ -11,6 +11,29 @@ from slack_sdk import WebClient
 from slack_sdk.signature import SignatureVerifier
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
+import re
+
+MAX_LENS_WORDS = int(os.getenv("MAX_LENS_WORDS", "160"))
+
+def _word_cap(md: str, limit: int = MAX_LENS_WORDS) -> str:
+    words = md.split()
+    if len(words) <= limit:
+        return md
+    return " ".join(words[:limit]) + " …"
+
+def _normalize_headers(md: str) -> str:
+    # Ensure expected headings are bold and in order
+    sections = {
+        "Verdict": r"(?:^|\n)\*?Verdict\*?\s*[:—-]",
+        "Payback": r"(?:^|\n)\*?Payback\*?\s*[:—-]",
+        "Key Points": r"(?:^|\n)\*?Key Points\*?\s*[:—-]",
+        "Risks & Mitigations": r"(?:^|\n)\*?Risks\s*&\s*Mitigations\*?\s*[:—-]"
+    }
+    out = md
+    for label, pat in sections.items():
+        out = re.sub(pat, f"\n*{label}* —", out, flags=re.IGNORECASE)
+    return out.strip()
+
 
 # ---------- Environment ----------
 load_dotenv()
@@ -327,13 +350,16 @@ def _fallback_lens_text(lens: str, text: str) -> str:
 def run_lens(lens: str, text: str) -> str:
     """
     Returns Slack-friendly markdown. Uses OpenAI if OPENAI_API_KEY is set; otherwise falls back.
+    Always normalizes headings and caps length.
     """
-    if not _oa:
-        return _fallback_lens_text(lens, text)
+    if not _oa:  # no API key -> use checklist
+        md = _fallback_lens_text(lens, text)
+        md = _normalize_headers(md)
+        return _word_cap(md, MAX_LENS_WORDS)
 
     focus = {
         "cfo_skeptic":   "payback period, cash impact vs EBITDA, sensitivity to forecast deltas, hidden costs",
-        "builder_ceo":   "shipping thin slices this week, deleting work (not adding), compounding effects in 90 days",
+        "builder_ceo":   "shipping thin slices this week, deleting work (not adding), 90-day compounding",
         "scaler":        "repeatability, unit economics at 10× volume, runbooks and guardrails",
         "challenger":    "sacred cows to challenge, blank-sheet alternative",
         "operator":      "KPI ownership, SOP/SLA strength, rollback plans",
@@ -342,30 +368,37 @@ def run_lens(lens: str, text: str) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     prompt = f"""
-Act as the {LENS_NAMES.get(lens,lens)} reviewing the proposal below.
-Write Slack-friendly markdown with exactly:
-1) *Verdict:* Go / Gate / Don't + 1-sentence why.
-2) *Payback:* best estimate in months (or 'n/a').
-3) *Key points:* 4–6 bullets focused on {focus}.
-4) *Risks & Mitigations:* 2–3 bullets.
+You are the {LENS_NAMES.get(lens,lens)} evaluating the proposal below.
+
+Return Slack-friendly Markdown under {MAX_LENS_WORDS} words with these headings, in this exact order:
+
+*Verdict* — **Go**/**Gate**/**Don't** with 1-sentence why.
+*Payback* — Best estimate in months (or “n/a”).
+*Key Points* — 4–6 bullets focused on {focus}.
+*Risks & Mitigations* — 2–3 bullets.
+
+No code fences. No intro/outro. Keep it crisp.
 
 Proposal:
 {text.strip()[:4000]}
 """.strip()
 
     try:
-        # OpenAI Python SDK v1.x
         resp = _oa.chat.completions.create(
             model=model,
-            messages=[{"role":"user","content": prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=450,
         )
         md = resp.choices[0].message.content.strip()
-        return md
     except Exception as e:
         print("[run_lens] LLM error:", repr(e))
-        return _fallback_lens_text(lens, text)
+        md = _fallback_lens_text(lens, text)
+
+    # Always apply formatting & cap length
+    md = _normalize_headers(md)
+    md = _word_cap(md, MAX_LENS_WORDS)
+    return md
 
 def _post_lens_result_async(lens: str, text: str, channel_id: str, user_id: str):
     md = run_lens(lens, text)
