@@ -184,24 +184,34 @@ def interactivity():
         if aid.startswith("lens_") or selected in {"cfo_skeptic","builder_ceo","scaler","challenger","operator"}:
             lens = selected
             label = LENS_NAMES.get(lens, lens)
-            original_text = (payload.get("message") or {}).get("text", "") or ""
 
-            # quick ack so user sees something
+            # Text of the Slack message the button belongs to
+            orig_text = (payload.get("message") or {}).get("text", "") or ""
+            picker_text = "which lens do you want to apply"
+            has_context = bool(orig_text.strip()) and picker_text not in orig_text.lower()
+
+            # Quick ack so the user sees something
             try:
                 client.chat_postEphemeral(channel=channel_id, user=user_id, text=f"⏳ {label} analysis…")
             except Exception as e:
                 print("[lens ack] error:", repr(e))
 
-            if original_text.strip():
-                # run in background and return fast
-                threading.Thread(
-                    target=_post_lens_result_async,
-                    args=(lens, original_text, channel_id, user_id),
-                    daemon=True
-                ).start()
+            if has_context:
+                # --- DEBUG: run synchronously so we SEE the result now ---
+                try:
+                    md = run_lens(lens, orig_text)
+                    client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user_id,
+                        text=label,
+                        blocks=[{"type":"section","text":{"type":"mrkdwn","text": md[:2900]}}],
+                    )
+                    print("[lens sync] posted result OK")
+                except Exception as e:
+                    print("[lens sync] post error:", repr(e))
                 return make_response("", 200)
 
-            # No context: PUSH a modal in the HTTP response (most reliable)
+            # No usable context (e.g., invoked from /lens). PUSH the modal in the HTTP response.
             view = {
                 "type": "modal",
                 "callback_id": "lens_modal",
@@ -221,9 +231,6 @@ def interactivity():
                 ]
             }
             return jsonify({"response_action": "push", "view": view})
-
-        # Unknown action
-        return make_response("", 200)
 
     # ---------- 3) MODAL SUBMISSIONS ----------
     if payload.get("type") == "view_submission":
