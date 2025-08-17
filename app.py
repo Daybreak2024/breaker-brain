@@ -1,4 +1,10 @@
 import os, json, sqlite3, time
+import threading
+try:
+    from openai import OpenAI
+    _oa = OpenAI()  # reads OPENAI_API_KEY from env
+except Exception:
+    _oa = None
 from datetime import datetime
 from flask import Flask, request, jsonify, make_response
 from slack_sdk import WebClient
@@ -133,23 +139,54 @@ def interactivity():
                 print("[interactivity/post_brief] error:", repr(e))
             return make_response("", 200)
 
-        # B) Lens buttons → send a helpful checklist
+        # B) Lens buttons → run analysis
         if aid.startswith("lens_") or selected in {"cfo_skeptic","builder_ceo","scaler","challenger","operator"}:
-            responses = {
-                "cfo_skeptic": "CFO Skeptic checklist:\n• Payback < 12 months?\n• Cash vs EBITDA?\n• Sensitivity to accuracy deltas?\n• Hidden costs (services/data/change mgmt)?",
-                "builder_ceo": "Builder CEO lens:\n• Ship a thin slice this week.\n• What becomes faster?\n• Delete work, don’t add it.\n• 90-day compounding?",
-                "scaler":      "Scaler lens:\n• Repeatable playbook?\n• Unit econ at 10× volume?\n• Runbooks + guardrails?",
-                "challenger":  "Challenger lens:\n• Which sacred cow to challenge?\n• If starting fresh, is this the path?",
-                "operator":    "Operator lens:\n• Who owns the KPI?\n• SOP + SLA?\n• Rollback plan if metrics slip?"
-            }
+            lens = selected
+            label = LENS_NAMES.get(lens, lens)
+
+            # Try to grab context if this came from a message shortcut
+            original_text = (payload.get("message") or {}).get("text", "") or ""
             try:
                 client.chat_postEphemeral(
                     channel=channel_id,
                     user=user_id,
-                    text=responses.get(selected, f"Lens applied: {selected}")
+                    text=f"⏳ {label} analysis…",
                 )
             except Exception as e:
-                print("[interactivity/lens] error:", repr(e))
+                print("[lens ack] error:", repr(e))
+
+            if original_text.strip():
+                # Run in background so we return 200 within Slack's 3s window
+                threading.Thread(target=_post_lens_result_async,
+                                 args=(lens, original_text, channel_id, user_id),
+                                 daemon=True).start()
+                return make_response("", 200)
+
+            # No context available (e.g., invoked via /lens). Open a modal to paste text.
+            try:
+                client.views_open(
+                    trigger_id=payload.get("trigger_id"),
+                    view={
+                        "type":"modal",
+                        "callback_id":"lens_modal",
+                        "private_metadata": json.dumps({
+                            "lens": lens,
+                            "channel_id": channel_id,
+                            "user_id": user_id
+                        }),
+                        "title":{"type":"plain_text","text":f"{label} Lens"},
+                        "submit":{"type":"plain_text","text":"Analyze"},
+                        "close":{"type":"plain_text","text":"Cancel"},
+                        "blocks":[
+                            {"type":"input","block_id":"ctx",
+                             "element":{"type":"plain_text_input","action_id":"v","multiline":True,
+                                        "placeholder":{"type":"plain_text","text":"Paste the proposal or context to analyze…"}},
+                             "label":{"type":"plain_text","text":"Context"}}
+                        ]
+                    }
+                )
+            except Exception as e:
+                print("[lens modal] error:", repr(e))
             return make_response("", 200)
 
         # Unknown action — still ack
@@ -157,51 +194,30 @@ def interactivity():
 
     # Modal submissions (only used if you add the /decide modal later)
     # ---------- Modal submissions (Decision Brief) ----------
-    if payload.get("type") == "view_submission" and (payload.get("view") or {}).get("callback_id") == "decide_modal":
-        try:
-            view = payload.get("view", {})
-            state = (view.get("state") or {}).get("values", {})
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {}) or {}
+        cb = view.get("callback_id", "")
+        if cb == "lens_modal":
+            try:
+                pm = json.loads(view.get("private_metadata") or "{}")
+                state = (view.get("state") or {}).get("values", {})
+                ctx = (((state.get("ctx") or {}).get("v") or {}).get("value") or "").strip()
+                lens = pm.get("lens")
+                chan = pm.get("channel_id")
+                usr = pm.get("user_id")
 
-            def get(bid):
-                return (((state.get(bid) or {}).get("v") or {}).get("value") or "").strip()
+                # quick ack to close the modal
+                try:
+                    client.chat_postEphemeral(channel=chan, user=usr, text=f"⏳ {LENS_NAMES.get(lens,lens)} analysis…")
+                except Exception as e:
+                    print("[lens modal ack] error:", repr(e))
 
-            title = get("title") or "Decision"
-            context = get("context")
-            options_text = get("options")
-            recommendation = get("recommendation")
-            risks = get("risks")
-
-            # Recover channel/user to reply ephemerally
-            pm = json.loads(view.get("private_metadata") or "{}")
-            chan = pm.get("channel_id") or channel_id
-            usr = pm.get("user_id") or user_id
-
-            blocks = [
-                {"type":"header","text":{"type":"plain_text","text": title[:150]}},
-                {"type":"section","text":{"type":"mrkdwn","text": f"*Context*\n{context or '—'}"}},
-                {"type":"section","text":{"type":"mrkdwn","text": f"*Options*\n{options_text or '—'}"}},
-                {"type":"section","text":{"type":"mrkdwn","text": f"*Recommendation*\n{recommendation or '—'}"}}
-            ]
-            if risks:
-                blocks.append({"type":"section","text":{"type":"mrkdwn","text": f"*Risks & Mitigations*\n{risks}"}})
-
-            # 🔽 Add the publish button
-            blocks.append({
-                "type":"actions",
-                "block_id":"brief_actions",
-                "elements":[
-                    {"type":"button",
-                     "text":{"type":"plain_text","text":"Post to channel"},
-                     "action_id":"post_brief",
-                     "value":"post"}
-                ]
-            })
-
-            client.chat_postEphemeral(channel=chan, user=usr, text="Decision Brief", blocks=blocks)
-            log_corpus("decision", f"{title} | {recommendation}", usr, chan, payload)
-        except Exception as e:
-            print("[interactivity/decide_modal] error:", repr(e))
-        return jsonify({"response_action":"clear"})
+                threading.Thread(target=_post_lens_result_async,
+                                 args=(lens, ctx, chan, usr),
+                                 daemon=True).start()
+            except Exception as e:
+                print("[lens modal submit] error:", repr(e))
+            return jsonify({"response_action": "clear"})
 
     return make_response("", 200)
 
@@ -321,6 +337,79 @@ def export_corpus():
 
     return {"ok": True, "path": out_path}, 200
 
+LENS_NAMES = {
+    "cfo_skeptic": "CFO Skeptic",
+    "builder_ceo": "Builder CEO",
+    "scaler": "Scaler",
+    "challenger": "Challenger",
+    "operator": "Operator",
+}
+
+def _fallback_lens_text(lens: str, text: str) -> str:
+    # Your existing checklists as a safe fallback
+    responses = {
+        "cfo_skeptic": "CFO Skeptic checklist:\n• Payback < 12 months?\n• Cash vs EBITDA?\n• Sensitivity to accuracy deltas?\n• Hidden costs (services/data/change mgmt)?",
+        "builder_ceo": "Builder CEO lens:\n• Ship a thin slice this week.\n• What becomes faster?\n• Delete work, don’t add it.\n• 90-day compounding?",
+        "scaler":      "Scaler lens:\n• Repeatable playbook?\n• Unit econ at 10× volume?\n• Runbooks + guardrails?",
+        "challenger":  "Challenger lens:\n• Which sacred cow to challenge?\n• If starting fresh, is this the path?",
+        "operator":    "Operator lens:\n• Who owns the KPI?\n• SOP + SLA?\n• Rollback plan if metrics slip?"
+    }
+    return responses.get(lens, f"Lens applied: {lens}")
+
+def run_lens(lens: str, text: str) -> str:
+    """
+    Returns Slack-friendly markdown. Uses OpenAI if OPENAI_API_KEY is set; otherwise falls back.
+    """
+    if not _oa:
+        return _fallback_lens_text(lens, text)
+
+    focus = {
+        "cfo_skeptic":   "payback period, cash impact vs EBITDA, sensitivity to forecast deltas, hidden costs",
+        "builder_ceo":   "shipping thin slices this week, deleting work (not adding), compounding effects in 90 days",
+        "scaler":        "repeatability, unit economics at 10× volume, runbooks and guardrails",
+        "challenger":    "sacred cows to challenge, blank-sheet alternative",
+        "operator":      "KPI ownership, SOP/SLA strength, rollback plans",
+    }.get(lens, "key decision criteria")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    prompt = f"""
+Act as the {LENS_NAMES.get(lens,lens)} reviewing the proposal below.
+Write Slack-friendly markdown with exactly:
+1) *Verdict:* Go / Gate / Don't + 1-sentence why.
+2) *Payback:* best estimate in months (or 'n/a').
+3) *Key points:* 4–6 bullets focused on {focus}.
+4) *Risks & Mitigations:* 2–3 bullets.
+
+Proposal:
+{text.strip()[:4000]}
+""".strip()
+
+    try:
+        # OpenAI Python SDK v1.x
+        resp = _oa.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content": prompt}],
+            temperature=0.2,
+            max_tokens=450,
+        )
+        md = resp.choices[0].message.content.strip()
+        return md
+    except Exception as e:
+        print("[run_lens] LLM error:", repr(e))
+        return _fallback_lens_text(lens, text)
+
+def _post_lens_result_async(lens: str, text: str, channel_id: str, user_id: str):
+    md = run_lens(lens, text)
+    try:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text=LENS_NAMES.get(lens, lens),
+            blocks=[{"type":"section","text":{"type":"mrkdwn","text": md[:2900]}}],
+        )
+    except Exception as e:
+        print("[post_lens] Slack error:", repr(e))
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
