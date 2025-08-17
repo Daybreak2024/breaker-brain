@@ -323,24 +323,15 @@ def interactivity():
                 return make_response("", 200)
 
             # No usable context → PUSH a modal in the HTTP response (most reliable)
-            view = {
-                "type": "modal",
-                "callback_id": "lens_modal",
-                "private_metadata": json.dumps({
-                    "lens": lens, "channel_id": channel_id, "user_id": user_id
-                }),
-                "title": {"type": "plain_text", "text": f"{label} Lens"},
-                "submit": {"type": "plain_text", "text": "Analyze"},
-                "close": {"type": "plain_text", "text": "Cancel"},
-                "blocks": [
-                    {"type":"input","block_id":"ctx",
-                     "element":{"type":"plain_text_input","action_id":"v","multiline":True,
-                                "placeholder":{"type":"plain_text","text":"Paste the proposal or context to analyze…"}},
-                     "label":{"type":"plain_text","text":"Context"}}
-                ]
-            }
-            print("[lens] pushing modal via response_action=push"); import sys; sys.stdout.flush()
-            return jsonify({"response_action": "push", "view": view})
+            trigger_id = payload.get("trigger_id")
+            try:
+                client.views_open(trigger_id=trigger_id, view=view)
+                print("[lens] opened modal via views.open")
+            except SlackApiError as e:
+                print("[lens] views.open error:", e.response.get("error"))
+            except Exception as e:
+                print("[lens] views.open other error:", repr(e))
+            return make_response("", 200)
 
         # Unknown action
         return make_response("", 200)
